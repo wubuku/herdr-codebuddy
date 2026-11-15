@@ -29,19 +29,6 @@ const EVENTS = {
 };
 
 const SESSION_ID = /^[a-zA-Z0-9][a-zA-Z0-9:_-]*$/;
-const SESSION_START_SOURCE = /^(startup|resume|clear|compact)$/;
-
-// Herdr only stores a native session reference (agent_session) for its
-// built-in (source, agent) pairs; a custom source's --agent-session-id is
-// dropped, so `herdr agent list` cannot find the pane by session id. Report
-// session identity separately under a built-in pair that accepts the
-// SessionStart sources Herdr will see. herdr:codex allows startup, clear,
-// resume, and compact, so a relaunch in the same pane replaces a stale id;
-// herdr:claude rejects startup. This report carries no state, so
-// custom:codebuddy keeps lifecycle authority and its resume command.
-// Overridable in case a Herdr build lists codebuddy natively.
-const SESSION_SOURCE = process.env.HERDR_CODEBUDDY_SESSION_SOURCE || 'herdr:codex';
-const SESSION_AGENT = process.env.HERDR_CODEBUDDY_SESSION_AGENT || 'codex';
 
 // What one hook event should report, or null when it maps to nothing.
 // Pure: reads the event only, no env, no I/O.
@@ -58,9 +45,8 @@ function decide(event) {
   if (name === 'SessionStart' && event.source === 'compact') state = 'working';
   if (name === 'SessionEnd' && event.reason === 'clear') return null;
 
-  // session_id is common to every hook event. Repeat it on each report so
-  // the resume command survives a dropped or superseded SessionStart one.
-  const sessionId = typeof event.session_id === 'string'
+  const sessionId = name === 'SessionStart'
+    && typeof event.session_id === 'string'
     && SESSION_ID.test(event.session_id)
     ? event.session_id
     : null;
@@ -69,11 +55,6 @@ function decide(event) {
     name,
     state,
     sessionId,
-    sessionStartSource: name === 'SessionStart'
-      && typeof event.source === 'string'
-      && SESSION_START_SOURCE.test(event.source)
-      ? event.source
-      : null,
     message: name === 'Notification' ? 'CodeBuddy permission required' : null,
   };
 }
@@ -99,30 +80,8 @@ function buildArgs(report, paneId, seq = currentSeq()) {
     '--seq', String(seq),
   ];
   if (state) args.push('--state', state);
+  if (sessionId) args.push('--agent-session-id', sessionId, '--', 'codebuddy', '--resume', sessionId);
   if (message) args.push('--message', message);
-  // `--` starts the resume argv, so it must come last; release-agent takes
-  // no session flags.
-  if (state && sessionId) args.push('--agent-session-id', sessionId, '--', 'codebuddy', '--resume', sessionId);
-  return args;
-}
-
-// A second, separate report for the native session identity. Herdr only
-// persists agent_session for its built-in (source, agent) pairs, so this one
-// uses that identity; the lifecycle report above keeps custom:codebuddy and
-// still owns idle/working/blocked. Only SessionStart carries a new identity --
-// it persists across later state reports, so no other event needs to repeat it.
-// No `--` resume argv here: that stays on the lifecycle report and wins at
-// restore, so a Herdr restart runs codebuddy --resume, not codex resume.
-function buildSessionArgs(report, paneId, seq = currentSeq()) {
-  if (report.name !== 'SessionStart' || !report.sessionId) return null;
-  const args = [
-    'pane', 'report-agent-session', paneId,
-    '--source', SESSION_SOURCE,
-    '--agent', SESSION_AGENT,
-    '--seq', String(seq),
-    '--agent-session-id', report.sessionId,
-  ];
-  if (report.sessionStartSource) args.push('--session-start-source', report.sessionStartSource);
   return args;
 }
 
@@ -143,34 +102,31 @@ async function main() {
   const report = decide(event);
   if (!report) return;
   const args = buildArgs(report, HERDR_PANE_ID);
-  const sessionArgs = buildSessionArgs(report, HERDR_PANE_ID);
 
   if (process.env.HERDR_CODEBUDDY_DRY_RUN === '1') {
-    console.log(JSON.stringify({ binary: HERDR_BIN_PATH, args, sessionArgs }));
+    console.log(JSON.stringify({ binary: HERDR_BIN_PATH, args }));
     return;
   }
 
   // Detached so a slow Herdr never holds up the CodeBuddy turn. Waiting for
   // spawn/error only learns whether exec happened (milliseconds); it never
   // waits on Herdr itself.
-  for (const argv of sessionArgs ? [args, sessionArgs] : [args]) {
-    const child = spawn(HERDR_BIN_PATH, argv, { detached: true, stdio: 'ignore', windowsHide: true });
-    await new Promise(resolve => {
-      child.once('spawn', resolve);
-      child.once('error', error => {
-        // Herdr's contract says to ignore failures. One log line keeps a dead
-        // binary from being a mystery; delete the file whenever.
-        try {
-          const line = `${new Date().toISOString()} ${report.name}: spawn ${JSON.stringify(HERDR_BIN_PATH)} failed (${error.code || error.message})\n`;
-          fs.appendFileSync(path.join(os.homedir(), '.codebuddy', 'hooks', 'herdr-codebuddy.log'), line);
-        } catch { /* nowhere to log, nowhere to complain */ }
-        resolve();
-      });
+  const child = spawn(HERDR_BIN_PATH, args, { detached: true, stdio: 'ignore', windowsHide: true });
+  await new Promise(resolve => {
+    child.once('spawn', resolve);
+    child.once('error', error => {
+      // Herdr's contract says to ignore failures. One log line keeps a dead
+      // binary from being a mystery; delete the file whenever.
+      try {
+        const line = `${new Date().toISOString()} ${report.name}: spawn ${JSON.stringify(HERDR_BIN_PATH)} failed (${error.code || error.message})\n`;
+        fs.appendFileSync(path.join(os.homedir(), '.codebuddy', 'hooks', 'herdr-codebuddy.log'), line);
+      } catch { /* nowhere to log, nowhere to complain */ }
+      resolve();
     });
-    child.unref();
-  }
+  });
+  child.unref();
 }
 
-module.exports = { EVENTS, decide, buildArgs, buildSessionArgs, currentSeq };
+module.exports = { EVENTS, decide, buildArgs, currentSeq };
 
 if (require.main === module) main().catch(() => {});

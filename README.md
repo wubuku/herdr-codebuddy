@@ -7,7 +7,7 @@ CodeBuddy hooks report session state to Herdr. This adds no Herdr process or scr
 
 | CodeBuddy event | Herdr report |
 | --- | --- |
-| `SessionStart` (`startup`, `resume`, `clear`) | `idle`, plus a separate session-identity report |
+| `SessionStart` (`startup`, `resume`, `clear`) | `idle`, with the session ID and `codebuddy --resume` command when available |
 | `SessionStart` (`compact`) | `working` |
 | `UserPromptSubmit` | `working` |
 | `PreToolUse`, `PostToolUse`, `PostToolUseFailure` | `working` |
@@ -15,8 +15,6 @@ CodeBuddy hooks report session state to Herdr. This adds no Herdr process or scr
 | `Stop`, `StopFailure` | `idle` |
 | `Notification` (`permission_prompt`) | `blocked` |
 | `SessionEnd` | release the agent; `/clear` reports nothing (the paired `SessionStart` reports the new session) |
-
-Every state report carries `--agent-session-id` and the `codebuddy --resume <id>` recovery command. `SessionStart` also sends a `pane report-agent-session` report: Herdr only persists a native `agent_session` reference for its built-in `(source, agent)` pairs, so this second report uses one (`herdr:codex`/`codex` by default) and is what lets `herdr agent list` find the pane by session ID. State and recovery stay on `custom:codebuddy`. The default pair accepts `startup`, `clear`, `resume`, and `compact`, so a relaunch in the same pane replaces a stale session ID. Set `HERDR_CODEBUDDY_SESSION_SOURCE` and `HERDR_CODEBUDDY_SESSION_AGENT` if a Herdr build lists `codebuddy` natively.
 
 ## Install
 
