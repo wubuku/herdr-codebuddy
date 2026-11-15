@@ -7,7 +7,7 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 
-const { EVENTS, decide, buildArgs, currentSeq } = require('./herdr-codebuddy-hook.js');
+const { EVENTS, decide, buildArgs, buildSessionArgs, currentSeq } = require('./herdr-codebuddy-hook.js');
 
 const HOOK = path.join(__dirname, 'herdr-codebuddy-hook.js');
 const INSTALLER = path.join(__dirname, 'install.js');
@@ -26,14 +26,14 @@ const STATES = [
   ['SessionStart', { session_id: 'session-abc' }, 'idle'],
   ['SessionStart', { session_id: 'session-compact', source: 'compact' }, 'working'],
   ['SessionStart', { session_id: 'session-clear', source: 'clear' }, 'idle'],
-  ['UserPromptSubmit', {}, 'working'],
-  ['PreToolUse', {}, 'working'],
-  ['PostToolUse', {}, 'working'],
-  ['PostToolUseFailure', {}, 'working'],
-  ['PermissionDenied', {}, 'working'],
-  ['Stop', {}, 'idle'],
-  ['StopFailure', {}, 'idle'],
-  ['Notification', { notification_type: 'permission_prompt' }, 'blocked'],
+  ['UserPromptSubmit', { session_id: 'session-abc' }, 'working'],
+  ['PreToolUse', { session_id: 'session-abc' }, 'working'],
+  ['PostToolUse', { session_id: 'session-abc' }, 'working'],
+  ['PostToolUseFailure', { session_id: 'session-abc' }, 'working'],
+  ['PermissionDenied', { session_id: 'session-abc' }, 'working'],
+  ['Stop', { session_id: 'session-abc' }, 'idle'],
+  ['StopFailure', { session_id: 'session-abc' }, 'idle'],
+  ['Notification', { session_id: 'session-abc', notification_type: 'permission_prompt' }, 'blocked'],
 ];
 
 function runHook(event, extra = {}, envOverrides = {}) {
@@ -78,12 +78,12 @@ test('maps lifecycle and permission events to report-agent states', () => {
     assert.equal(arg(result, '--source'), 'custom:codebuddy');
     assert.equal(arg(result, '--agent'), 'codebuddy');
     assert.ok(Number(arg(result, '--seq')) >= 1e18);
-    if (event === 'SessionStart') {
-      assert.equal(arg(result, '--agent-session-id'), payload.session_id);
-      assert.deepEqual(result.args.slice(result.args.indexOf('--') + 1), [
-        'codebuddy', '--resume', payload.session_id,
-      ]);
-    }
+    // Every state report repeats the id for the resume command, so a
+    // superseded SessionStart cannot drop it.
+    assert.equal(arg(result, '--agent-session-id'), payload.session_id, event);
+    assert.deepEqual(result.args.slice(result.args.indexOf('--') + 1), [
+      'codebuddy', '--resume', payload.session_id,
+    ], event);
   }
 });
 
@@ -97,10 +97,11 @@ test('decide ignores unknown, malformed, and unrelated events', () => {
 
 test('decide maps one event to one report', () => {
   assert.deepEqual(decide({ hook_event_name: 'Stop' }), {
-    name: 'Stop', state: 'idle', sessionId: null, message: null,
+    name: 'Stop', state: 'idle', sessionId: null, sessionStartSource: null, message: null,
   });
   assert.deepEqual(decide({ hook_event_name: 'Notification', notification_type: 'permission_prompt' }), {
-    name: 'Notification', state: 'blocked', sessionId: null, message: 'CodeBuddy permission required',
+    name: 'Notification', state: 'blocked', sessionId: null, sessionStartSource: null,
+    message: 'CodeBuddy permission required',
   });
   assert.equal(decide({ hook_event_name: 'SessionStart', session_id: "bad'id" }).sessionId, null);
 });
@@ -113,6 +114,129 @@ test('buildArgs is a pure function of the decision', () => {
     '--state', 'idle',
     '--agent-session-id', 'session-abc', '--', 'codebuddy', '--resume', 'session-abc',
   ]);
+});
+
+test('decide carries the session id on every event, not just SessionStart', () => {
+  for (const name of ['UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'PostToolUseFailure',
+    'PermissionDenied', 'Stop', 'StopFailure']) {
+    const report = decide({ hook_event_name: name, session_id: 'session-live' });
+    assert.ok(report.state, name);
+    assert.equal(report.sessionId, 'session-live', name);
+  }
+  assert.equal(decide({
+    hook_event_name: 'Notification', notification_type: 'permission_prompt', session_id: 'session-live',
+  }).sessionId, 'session-live');
+});
+
+test('keeps --message before the -- resume argv separator', () => {
+  const result = runHook('Notification', {
+    session_id: 'session-abc', notification_type: 'permission_prompt',
+  });
+  assert.equal(arg(result, '--message'), 'CodeBuddy permission required');
+  // The exact resume argv proves no flag leaked past `--`.
+  assert.deepEqual(result.args.slice(result.args.indexOf('--') + 1), [
+    'codebuddy', '--resume', 'session-abc',
+  ]);
+});
+
+// Herdr applies only a report whose --seq is higher than the last one it
+// accepted, and detached hook processes can arrive out of order. With the
+// SessionStart report dropped, the surviving report must carry the id.
+test('session identity survives a superseded SessionStart report', () => {
+  const events = [
+    { hook_event_name: 'SessionStart', source: 'startup', session_id: 'session-race' },
+    { hook_event_name: 'UserPromptSubmit', session_id: 'session-race' },
+    { hook_event_name: 'Stop', session_id: 'session-race' },
+  ];
+  const reports = events.map((event, i) => buildArgs(decide(event), 'pane-test', 100 + i));
+  // Reverse arrival: Herdr keeps the highest --seq, i.e. the Stop report.
+  const applied = [...reports].reverse().reduce((best, args) =>
+    BigInt(arg({ args }, '--seq')) > BigInt(arg({ args: best }, '--seq')) ? args : best);
+  assert.equal(arg({ args: applied }, '--state'), 'idle');
+  assert.equal(arg({ args: applied }, '--agent-session-id'), 'session-race');
+});
+
+test('every registered event carries the session id on its state report', () => {
+  const extra = {
+    SessionEnd: { reason: 'logout' },
+    Notification: { notification_type: 'permission_prompt' },
+  };
+  for (const event of EVENT_NAMES) {
+    const result = runHook(event, { session_id: 'session-all', ...extra[event] });
+    if (result === null) continue;
+    if (result.args[1] === 'release-agent') {
+      assert.ok(!result.args.includes('--agent-session-id'), event);
+      continue;
+    }
+    assert.equal(arg(result, '--agent-session-id'), 'session-all', event);
+    assert.deepEqual(result.args.slice(result.args.indexOf('--') + 1), [
+      'codebuddy', '--resume', 'session-all',
+    ], event);
+  }
+});
+
+test('a later event reports its own session id, not a stale one', () => {
+  const first = runHook('SessionStart', { session_id: 'session-old' });
+  const next = runHook('Stop', { session_id: 'session-new' });
+  assert.equal(arg(first, '--agent-session-id'), 'session-old');
+  assert.equal(arg(next, '--agent-session-id'), 'session-new');
+  assert.deepEqual(next.args.slice(next.args.indexOf('--') + 1), [
+    'codebuddy', '--resume', 'session-new',
+  ]);
+});
+
+// Herdr drops --agent-session-id from a custom source, so a second report
+// under a built-in (source, agent) pair carries the native session identity.
+test('buildSessionArgs reports session identity under a built-in pair', () => {
+  const report = decide({ hook_event_name: 'SessionStart', source: 'startup', session_id: 'session-abc' });
+  assert.deepEqual(buildSessionArgs(report, 'pane-test', 7), [
+    'pane', 'report-agent-session', 'pane-test',
+    '--source', 'herdr:codex', '--agent', 'codex', '--seq', '7',
+    '--agent-session-id', 'session-abc',
+    '--session-start-source', 'startup',
+  ]);
+  // No state and no `--` resume argv: custom:codebuddy keeps lifecycle
+  // authority and its codebuddy --resume command stays the restore target.
+  assert.ok(!buildSessionArgs(report, 'pane-test', 7).includes('--state'));
+  assert.ok(!buildSessionArgs(report, 'pane-test', 7).includes('--'));
+});
+
+test('buildSessionArgs only fires on SessionStart with a valid id', () => {
+  assert.equal(buildSessionArgs(decide({ hook_event_name: 'Stop', session_id: 'session-abc' }), 'pane-test'), null);
+  assert.equal(buildSessionArgs(decide({ hook_event_name: 'SessionStart', source: 'startup' }), 'pane-test'), null);
+  assert.equal(buildSessionArgs(decide({ hook_event_name: 'SessionStart', source: 'startup', session_id: "bad'id" }), 'pane-test'), null);
+  assert.equal(buildSessionArgs(decide({ hook_event_name: 'SessionEnd', reason: 'logout', session_id: 'session-abc' }), 'pane-test'), null);
+});
+
+test('buildSessionArgs forwards recognised session-start sources', () => {
+  for (const source of ['startup', 'resume', 'clear', 'compact']) {
+    const args = buildSessionArgs(decide({ hook_event_name: 'SessionStart', source, session_id: 'session-abc' }), 'pane-test', 7);
+    assert.equal(arg({ args }, '--session-start-source'), source, source);
+  }
+  // /clear and compaction can replace the previous id; startup/resume too.
+  const unknown = buildSessionArgs(decide({ hook_event_name: 'SessionStart', source: 'other', session_id: 'session-abc' }), 'pane-test', 7);
+  assert.ok(!unknown.includes('--session-start-source'));
+});
+
+test('hook emits both reports on SessionStart and one elsewhere', () => {
+  const start = runHook('SessionStart', { source: 'startup', session_id: 'session-abc' });
+  assert.equal(start.sessionArgs[1], 'report-agent-session');
+  assert.equal(arg({ args: start.sessionArgs }, '--agent-session-id'), 'session-abc');
+  assert.equal(start.args[1], 'report-agent');
+  assert.equal(arg(start, '--source'), 'custom:codebuddy');
+  for (const [event, payload] of STATES.filter(([name]) => name !== 'SessionStart')) {
+    assert.equal(runHook(event, payload).sessionArgs, null, event);
+  }
+});
+
+test('session identity pair is configurable via environment', () => {
+  const result = runHook('SessionStart', { source: 'startup', session_id: 'session-abc' }, {
+    HERDR_CODEBUDDY_SESSION_SOURCE: 'herdr:codebuddy',
+    HERDR_CODEBUDDY_SESSION_AGENT: 'codebuddy',
+  });
+  assert.equal(arg({ args: result.sessionArgs }, '--source'), 'herdr:codebuddy');
+  assert.equal(arg({ args: result.sessionArgs }, '--agent'), 'codebuddy');
+  assert.equal(arg(result, '--source'), 'custom:codebuddy');
 });
 
 test('seq is nanosecond-scale, decimal, and strictly increasing', async () => {
@@ -128,16 +252,20 @@ test('every registered event has a test', () => {
 });
 
 test('omits recovery data for invalid session IDs', () => {
-  const result = runHook('SessionStart', { session_id: "bad'id" });
-  assert.ok(!result.args.includes('--agent-session-id'));
-  assert.ok(!result.args.includes('--'));
+  for (const event of ['SessionStart', 'UserPromptSubmit', 'Stop']) {
+    const result = runHook(event, { session_id: "bad'id" });
+    assert.ok(!result.args.includes('--agent-session-id'), event);
+    assert.ok(!result.args.includes('--'), event);
+  }
 });
 
 test('releases the reported agent on SessionEnd', () => {
   for (const reason of ['logout', 'prompt_input_exit', 'other']) {
-    const result = runHook('SessionEnd', { reason });
+    const result = runHook('SessionEnd', { reason, session_id: 'session-abc' });
     assert.deepEqual(result.args.slice(0, 3), ['pane', 'release-agent', 'pane-test']);
     assert.ok(!result.args.includes('--state'));
+    assert.ok(!result.args.includes('--agent-session-id'));
+    assert.ok(!result.args.includes('--'));
   }
 });
 
@@ -146,8 +274,8 @@ test('releases the reported agent on SessionEnd', () => {
 // new session id. Reporting here too would race it for the higher --seq,
 // and Herdr drops the loser -- the session id.
 test('reports nothing on /clear', () => {
-  assert.equal(runHook('SessionEnd', { reason: 'clear' }), null);
-  assert.equal(decide({ hook_event_name: 'SessionEnd', reason: 'clear' }), null);
+  assert.equal(runHook('SessionEnd', { reason: 'clear', session_id: 'session-new' }), null);
+  assert.equal(decide({ hook_event_name: 'SessionEnd', reason: 'clear', session_id: 'session-new' }), null);
 });
 
 test('logs a spawn failure and still exits cleanly', () => {
